@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-h3-prompt-optimizer"
+version = "0.7.0"
+description = "Human-in-the-loop prompt optimization for MiniMax H3 Ref2VA workflows"
+requires-python = ">=3.10"
+
+[tool.comfy]
+PublisherId = "local"
+DisplayName = "ComfyUI H3 Prompt Optimizer"
+Icon = ""
