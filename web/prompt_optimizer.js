@@ -12,6 +12,7 @@ const TARGET_NODES = [COMBINED_TARGET_NODE, SPLIT_TARGET_NODE];
 const RECORDER_NODE = "H3OptimizerVideoOutputCS";
 const SEGMENT_SETTINGS_NODE = "H3OptimizerSegmentSettingsCS";
 const SIDEBAR_ID = "h3-prompt-optimizer";
+const UNTRACKED_STATE_HASH = "0".repeat(64);
 
 let panel = null;
 let currentGeneration = null;
@@ -111,56 +112,6 @@ function linkInfo(linkId) {
 }
 
 
-function ancestorState(root) {
-    const seen = new Set();
-    const nodes = [];
-    const links = [];
-
-    function visit(node) {
-        if (!node || seen.has(String(node.id))) {
-            return;
-        }
-        seen.add(String(node.id));
-        for (const input of node.inputs || []) {
-            const link = linkInfo(input.link);
-            if (!link) {
-                continue;
-            }
-            links.push({
-                origin_id: String(link.origin_id),
-                origin_slot: link.origin_slot,
-                target_id: String(link.target_id),
-                target_slot: link.target_slot,
-            });
-            visit(app.graph.getNodeById(link.origin_id));
-        }
-        nodes.push({
-            id: String(node.id),
-            type: node.type,
-            mode: node.mode,
-            widgets: (node.widgets || []).map((item) => ({name: item.name, value: item.value})),
-        });
-    }
-
-    visit(root);
-    nodes.sort((left, right) => left.id.localeCompare(right.id, undefined, {numeric: true}));
-    links.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-    return {nodes, links};
-}
-
-
-async function sha256(value) {
-    const bytes = new TextEncoder().encode(value);
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
-    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-
-async function targetStateHash(optimizerId) {
-    return sha256(JSON.stringify(ancestorState(targetNode(optimizerId))));
-}
-
-
 async function requestJson(path, options = {}) {
     const response = await api.fetchApi(path, options);
     let body = null;
@@ -182,6 +133,20 @@ function setStatus(message, kind = "") {
     }
     panel.status.textContent = message;
     panel.status.dataset.kind = kind;
+}
+
+
+async function refreshBackendStatus() {
+    if (!panel) {
+        return;
+    }
+    try {
+        const status = await requestJson("/h3_optimizer/status");
+        const backend = status.critic_backend === "llama_cli" ? "local llama-cli" : "OpenAI-compatible";
+        panel.backend.textContent = `VLM: ${backend} / ${status.critic_model}`;
+    } catch (error) {
+        panel.backend.textContent = `VLM設定エラー: ${error.message}`;
+    }
 }
 
 
@@ -340,56 +305,28 @@ function applyGraphChange(analysis, generate) {
 }
 
 
-async function confirmAnalysisCanApply() {
+function requireAnalysis() {
     if (!currentAnalysis || !currentGeneration) {
         throw new Error("Applyする解析結果がありません。");
     }
-    const optimizerId = currentAnalysis.optimizer_id;
-    const hash = await targetStateHash(optimizerId);
-    let targetChanged = false;
-    if (hash !== currentAnalysis.target_state_hash) {
-        if (!window.confirm(
-            "解析後に対象ノードまたは上流が変更されています。解析結果が現在のノード状態と一致しない可能性があります。変更を無視してApplyしますか？",
-        )) {
-            return null;
-        }
-        targetChanged = true;
-    }
-    const latest = await requestJson(
-        `/h3_optimizer/generations/latest?optimizer_id=${encodeURIComponent(optimizerId)}`,
-    );
-    if (latest.generation_id !== currentAnalysis.generation_id) {
-        throw new Error("新しい生成結果が登録されています。その動画を確認して解析し直してください。");
-    }
-    return {targetChanged};
 }
 
 
 async function applyAnalysis(generate) {
     try {
-        setStatus("Apply条件を確認中…");
-        const validation = await confirmAnalysisCanApply();
-        if (!validation) {
-            setStatus("Applyを中止しました。");
-            return;
-        }
+        setStatus("承認内容を反映中…");
+        requireAnalysis();
         applyGraphChange(currentAnalysis, generate);
         panel.apply.disabled = true;
         panel.applyGenerate.disabled = true;
         if (generate) {
-            const message = validation.targetChanged
-                ? "ノード変更を無視して承認内容を反映し、再生成をキューに追加します。"
-                : "承認内容を反映し、再生成をキューに追加します。";
-            setStatus(message, "success");
+            setStatus("承認内容を反映し、再生成をキューに追加します。", "success");
             await app.queuePrompt(0);
         } else {
             await requestJson(`/h3_optimizer/analyses/${currentAnalysis.analysis_id}/applied`, {
                 method: "POST",
             });
-            const message = validation.targetChanged
-                ? "ノード変更を無視して承認内容をワークフローへ反映しました。"
-                : "承認内容をワークフローへ反映しました。";
-            setStatus(message, "success");
+            setStatus("承認内容をワークフローへ反映しました。", "success");
         }
     } catch (error) {
         setStatus(error.message, "error");
@@ -478,14 +415,12 @@ async function analyze() {
             timeRange = {start_sec: start, end_sec: end};
         }
 
-        const optimizerId = panel.optimizer.value;
         currentAnalysis = null;
         panel.analysis.replaceChildren();
         panel.apply.disabled = true;
         panel.applyGenerate.disabled = true;
         setStatus("動画を解析中…");
         panel.analyze.disabled = true;
-        const stateHash = await targetStateHash(optimizerId);
         requestId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
         activeAnalysisRequestId = requestId;
         panel.analyze.textContent = "解析を中断";
@@ -500,7 +435,7 @@ async function analyze() {
                 generation_id: currentGeneration.generation_id,
                 feedback,
                 time_range: timeRange,
-                target_state_hash: stateHash,
+                target_state_hash: UNTRACKED_STATE_HASH,
             }),
         });
         renderAnalysis(currentAnalysis);
@@ -645,6 +580,9 @@ function button(text, onClick) {
 
 function renderSidebar(root) {
     root.classList.add("h3-optimizer-panel");
+    const backend = document.createElement("div");
+    backend.className = "h3-optimizer-meta";
+    backend.textContent = "VLM設定を確認中…";
     const optimizer = document.createElement("select");
     const refresh = button("最新動画を読込", refreshGeneration);
     const generation = document.createElement("select");
@@ -693,6 +631,7 @@ function renderSidebar(root) {
     status.className = "h3-optimizer-status";
 
     root.replaceChildren(
+        backend,
         labeledInput("Optimizer ID", optimizer),
         refresh,
         labeledInput("生成履歴", generation),
@@ -708,11 +647,12 @@ function renderSidebar(root) {
         actions,
         status,
     );
-    panel = {root, optimizer, generation, video, meta, settings, prompt, restore,
+    panel = {root, backend, optimizer, generation, video, meta, settings, prompt, restore,
         restoreGenerate, feedback, start, end, analyze: analyzeButton, analysis, apply,
         applyGenerate, status};
     optimizer.addEventListener("change", refreshGeneration);
     generation.addEventListener("change", selectGeneration);
+    refreshBackendStatus();
     refreshGeneration();
 }
 

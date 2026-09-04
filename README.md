@@ -77,20 +77,37 @@ Checkpoint が LOAD する segment では Video Output は `prompt_state` を評
 
 ## VLM 設定
 
-解析先は画像入力対応の OpenAI-compatible `/v1/chat/completions` です。既定値は `http://localhost:1234` です。設定の優先順位は次の通りです。
+解析には、画像入力対応の OpenAI-compatible `/v1/chat/completions` またはローカルの`llama-cli`を使用できます。既定はOpenAI-compatible方式で、URLの既定値は`http://localhost:1234`です。VLM設定にはPrompt Generatorと共通の`MINIMAX_*`キーを使用します。Optimizerでの設定の優先順位は次の通りです。
 
-1. プロセス環境変数
-2. このディレクトリの `.env`
-3. `MINIMAX_BASE_URL` に限り、既存 `ComfyUI-MiniMaxH3-Prompt-Generator/.env`
+1. プロセス環境変数の`H3_OPTIMIZER_*`、次に`MINIMAX_*`
+2. このディレクトリの`.env`にある`H3_OPTIMIZER_*`、次に`MINIMAX_*`
+3. `ComfyUI-MiniMaxH3-Prompt-Generator/.env`にある`MINIMAX_*`
 4. 既定値
 
-`.env.example` を `.env` としてコピーし、必要な値だけ変更してください。`H3_OPTIMIZER_MODEL` を省略するとサーバー側のロード済みモデルを使用します。
+同じ設定を両プラグインで使用する場合は、Prompt Generator側の`.env`だけに`MINIMAX_*`を設定し、Optimizer側では該当キーを省略できます。両ディレクトリの`.env`に同じキーがある場合、ファイルは上書きされません。Optimizerは自身の`.env`の値を、Prompt Generatorは自身の`.env`の値を使用するため、意図的に別設定にすることもできます。
+
+既存の`H3_OPTIMIZER_*`キーも後方互換性のため利用でき、対応する`MINIMAX_*`より優先されます。OptimizerだけバックエンドやCLIモデルを変更したい場合の上書きに使用してください。`H3_OPTIMIZER_MODEL`、`H3_OPTIMIZER_API_KEY`、`H3_OPTIMIZER_TIMEOUT_SECONDS`はCritic/PlannerのHTTP要求に固有の設定です。`H3_OPTIMIZER_MODEL`を省略するとサーバー側のロード済みモデルを使用します。
 
 ```text
-H3_OPTIMIZER_BASE_URL=http://localhost:1234
+MINIMAX_BASE_URL=http://localhost:1234
 H3_OPTIMIZER_MODEL=Qwen3-VL-8B-Instruct
 H3_OPTIMIZER_TIMEOUT_SECONDS=300
 ```
+
+ローカルの`llama-cli`を使用する場合は、`.env`へ次の設定を追加します。モデルと`mmproj`には対応する画像入力対応GGUFを指定してください。
+
+```text
+MINIMAX_VLM_BACKEND=llama_cli
+MINIMAX_LLAMA_CLI_PATH=/absolute/path/to/llama-cli
+MINIMAX_LLAMA_MODEL_PATH=/absolute/path/to/vlm-model.gguf
+MINIMAX_LLAMA_MMPROJ_PATH=/absolute/path/to/mmproj-model.gguf
+```
+
+CLI方式では解析開始前にComfyUIのモデルをVRAMからアンロードします。ComfyUIの実行中・待機中Queueがある場合と、別のローカル解析が実行中の場合は開始しません。各LLM要求で`llama-cli`を1回起動し、終了時にモデルを解放します。通常の解析ではCriticとPlannerなどで複数回起動することがあります。ローカル解析中は新しいComfyUI Queueを開始しないでください。次回の通常Queueでは必要なComfyUIモデルが自動的に再ロードされます。
+
+Prompt Generator側の`.env`に共通設定を置けば、サイドバーのCritic/Planner解析と`use_approved_prompt=false`で実行される初回Prompt生成の両方に適用されます。両プラグインのローカルCLI推論は共有ロックにより同時実行されません。
+
+CLI方式では、チャットテンプレートの生成prefixと`llama.cpp`のJSON Schema文法が衝突しないよう、汎用JSONオブジェクト文法で生成を制約した後にPydanticで要求スキーマを厳密に検証します。VLM応答がJSONまたは要求スキーマに一致しない場合は、初回生成と修正生成を区別し、スキーマ名、応答の先頭1600文字、`llama-cli`診断出力の末尾1600文字をComfyUIログへ記録します。応答が空の場合は、画像数、生成トークン上限、コンテキストサイズとCLIのタイミング情報も記録します。
 
 ## 操作
 
@@ -103,7 +120,7 @@ H3_OPTIMIZER_TIMEOUT_SECONDS=300
 
 同じPrompt・seedでも、解像度やstepsを変更すると拡散計算そのものが変わるため、低品質版とフレーム単位で同一の動画にはなりません。完全な再現には、保存した条件に加えてモデルファイル、参照素材、ComfyUI/custom node、計算backendも同じである必要があります。
 
-`PATCH_PROMPT` と `REGENERATE_SAME_PROMPT` だけが自動 Apply できます。Criticの原因分類は参考情報としてPlannerが再評価するため、`MODEL_CAPABILITY_LIMIT`と判定されても、Promptの不足・矛盾を許可範囲で修正できる場合はPatchを提案します。参照変更、証拠不足、Promptでも再生成でも対処できない問題は自動変更しません。解析後に Prompt ノードまたはその上流が変わった場合と、新しい動画が登録された場合は stale proposal として Apply を拒否します。
+`PATCH_PROMPT` と `REGENERATE_SAME_PROMPT` だけが自動 Apply できます。Criticの原因分類は参考情報としてPlannerが再評価するため、`MODEL_CAPABILITY_LIMIT`と判定されても、Promptの不足・矛盾を許可範囲で修正できる場合はPatchを提案します。参照変更、証拠不足、Promptでも再生成でも対処できない問題は自動変更しません。解析後に Prompt ノードやその上流が変更された場合や、新しい動画が登録された場合も、解析結果のPromptを現在の対象ノードへApplyします。
 
 ## 解析と保存
 

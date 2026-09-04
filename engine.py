@@ -15,7 +15,7 @@ from .prompt_document import (
 from .registry import create_analysis, generation_artifact, get_generation
 from .schemas import CriticResult, PatchPlan
 from .video_sampling import sample_video
-from .vlm import generate_structured
+from .vlm import generate_structured, inference_session
 
 
 CRITIC_SYSTEM_PROMPT = """You are a grounded video critic for MiniMax H3 generations.
@@ -202,26 +202,27 @@ async def analyze_generation(request, cancel_event=None):
     artifact_path = generation_artifact(request.generation_id)
     if artifact_path is None or not artifact_path.is_file():
         raise ValueError("Generation artifact is missing.")
-    critic = await _analyze_frames(
-        generation, request.feedback.strip(), requested_range, artifact_path, cancel_event
-    )
-
-    patch = _non_patch_plan(critic)
-    localization = critic.localization.model_dump() if critic.localization else requested_range
-    allowed_paths = allowed_patch_paths(prompt_ir, critic.issue_type, localization)
-    if patch is None:
-        planner_input = {
-            "human_feedback": request.feedback.strip(),
-            "critic": critic.model_dump(),
-            "allowed_paths": sorted(allowed_paths),
-            "prompt_ir": prompt_ir,
-        }
-        patch = await generate_structured(
-            PATCH_SYSTEM_PROMPT,
-            json.dumps(planner_input, ensure_ascii=False),
-            [],
-            PatchPlan,
+    async with inference_session():
+        critic = await _analyze_frames(
+            generation, request.feedback.strip(), requested_range, artifact_path, cancel_event
         )
+
+        patch = _non_patch_plan(critic)
+        localization = critic.localization.model_dump() if critic.localization else requested_range
+        allowed_paths = allowed_patch_paths(prompt_ir, critic.issue_type, localization)
+        if patch is None:
+            planner_input = {
+                "human_feedback": request.feedback.strip(),
+                "critic": critic.model_dump(),
+                "allowed_paths": sorted(allowed_paths),
+                "prompt_ir": prompt_ir,
+            }
+            patch = await generate_structured(
+                PATCH_SYSTEM_PROMPT,
+                json.dumps(planner_input, ensure_ascii=False),
+                [],
+                PatchPlan,
+            )
 
     if patch.action == "PATCH_PROMPT":
         updated_ir = apply_patch(prompt_ir, patch.operations, allowed_paths)

@@ -20,7 +20,12 @@ from .registry import (
     mark_analysis_applied,
 )
 from .schemas import AnalyzeRequest
-from .vlm import chat_completions_url, setting
+from .vlm import (
+    VLMBackendBusyError,
+    VLMConfigurationError,
+    VLMProcessError,
+    backend_status,
+)
 
 
 log = logging.getLogger(__name__)
@@ -54,14 +59,13 @@ def _cancel_analysis(request_id):
 @routes.get("/h3_optimizer/status")
 async def optimizer_status(_request):
     try:
-        endpoint = chat_completions_url()
-    except ValueError as error:
-        return _error(error)
+        vlm_status = backend_status()
+    except VLMConfigurationError as error:
+        return _error(error, status=503)
     return web.json_response({
         "status": "ready",
-        "version": "0.7.0",
-        "critic_endpoint": endpoint,
-        "critic_model": setting("H3_OPTIMIZER_MODEL", "server default"),
+        "version": "0.8.1",
+        **vlm_status,
     })
 
 
@@ -131,6 +135,12 @@ async def optimizer_analyze(request):
             if running is not None and running[0] is task:
                 del _ANALYSIS_TASKS[request_id]
         return web.json_response(result)
+    except VLMBackendBusyError as error:
+        return _error(error, status=409)
+    except VLMConfigurationError as error:
+        return _error(error, status=503)
+    except VLMProcessError as error:
+        return _error(error, status=502)
     except (ValidationError, ValueError) as error:
         return _error(error)
     except Exception as error:

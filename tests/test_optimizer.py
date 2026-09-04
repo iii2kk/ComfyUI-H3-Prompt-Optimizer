@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import importlib
 import importlib.util
@@ -682,6 +683,348 @@ class SchemaTests(unittest.TestCase):
             ProbeResult,
         )
         self.assertEqual(result.status, "ok")
+
+
+class VLMBackendTests(unittest.TestCase):
+    def test_llama_cli_lock_is_shared_with_prompt_generator(self):
+        vlm = plugin_module("vlm")
+        adapter = importlib.import_module(
+            "custom_nodes.ComfyUI-MiniMaxH3-Prompt-Generator.llama_cli"
+        )
+        self.assertIs(vlm._LLAMA_SESSION_LOCK, adapter.SESSION_LOCK)
+
+    def test_legacy_llama_cli_settings_are_loaded_from_plugin_env(self):
+        vlm = plugin_module("vlm")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = root / "llama-cli"
+            model = root / "model.gguf"
+            mmproj = root / "mmproj.gguf"
+            cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            cli.chmod(0o700)
+            model.write_bytes(b"model")
+            mmproj.write_bytes(b"mmproj")
+            (root / ".env").write_text(
+                "\n".join((
+                    "H3_OPTIMIZER_VLM_BACKEND=llama_cli",
+                    "H3_OPTIMIZER_LLAMA_CLI_PATH=%s" % cli,
+                    "H3_OPTIMIZER_LLAMA_MODEL_PATH=%s" % model,
+                    "H3_OPTIMIZER_LLAMA_MMPROJ_PATH=%s" % mmproj,
+                    "H3_OPTIMIZER_LLAMA_CTX_SIZE=32768",
+                )),
+                encoding="utf-8",
+            )
+            names = {
+                "H3_OPTIMIZER_VLM_BACKEND",
+                "H3_OPTIMIZER_LLAMA_CLI_PATH",
+                "H3_OPTIMIZER_LLAMA_MODEL_PATH",
+                "H3_OPTIMIZER_LLAMA_MMPROJ_PATH",
+                "H3_OPTIMIZER_LLAMA_CTX_SIZE",
+            }
+            environment = {key: value for key, value in vlm.os.environ.items() if key not in names}
+            with mock.patch.object(vlm, "PLUGIN_DIRECTORY", root), mock.patch.dict(
+                vlm.os.environ, environment, clear=True
+            ):
+                config = vlm._llama_cli_config()
+                self.assertEqual(vlm.vlm_backend(), "llama_cli")
+
+            self.assertEqual(config.cli_path, cli)
+            self.assertEqual(config.model_path, model)
+            self.assertEqual(config.mmproj_path, mmproj)
+            self.assertEqual(config.ctx_size, 32768)
+
+    def test_shared_llama_cli_settings_are_loaded_from_generator_env(self):
+        vlm = plugin_module("vlm")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            optimizer_root = root / "optimizer"
+            generator_root = root / "generator"
+            optimizer_root.mkdir()
+            generator_root.mkdir()
+            cli = root / "llama-cli"
+            model = root / "model.gguf"
+            mmproj = root / "mmproj.gguf"
+            cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            cli.chmod(0o700)
+            model.write_bytes(b"model")
+            mmproj.write_bytes(b"mmproj")
+            generator_env = generator_root / ".env"
+            generator_env.write_text(
+                "\n".join((
+                    "MINIMAX_VLM_BACKEND=llama_cli",
+                    "MINIMAX_LLAMA_CLI_PATH=%s" % cli,
+                    "MINIMAX_LLAMA_MODEL_PATH=%s" % model,
+                    "MINIMAX_LLAMA_MMPROJ_PATH=%s" % mmproj,
+                    "MINIMAX_LLAMA_CTX_SIZE=24576",
+                )),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(vlm, "PLUGIN_DIRECTORY", optimizer_root), mock.patch.object(
+                vlm, "PROMPT_GENERATOR_ENV", generator_env
+            ), mock.patch.dict(vlm.os.environ, {}, clear=True):
+                config = vlm._llama_cli_config()
+                self.assertEqual(vlm.vlm_backend(), "llama_cli")
+
+            self.assertEqual(config.cli_path, cli)
+            self.assertEqual(config.model_path, model)
+            self.assertEqual(config.mmproj_path, mmproj)
+            self.assertEqual(config.ctx_size, 24576)
+
+    def test_shared_setting_priority_does_not_overwrite_env_files(self):
+        vlm = plugin_module("vlm")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            optimizer_root = root / "optimizer"
+            generator_root = root / "generator"
+            optimizer_root.mkdir()
+            generator_root.mkdir()
+            optimizer_env = optimizer_root / ".env"
+            generator_env = generator_root / ".env"
+            optimizer_text = "MINIMAX_LLAMA_MODEL_PATH=/optimizer/model.gguf\n"
+            generator_text = "MINIMAX_LLAMA_MODEL_PATH=/generator/model.gguf\n"
+            optimizer_env.write_text(optimizer_text, encoding="utf-8")
+            generator_env.write_text(generator_text, encoding="utf-8")
+
+            with mock.patch.object(vlm, "PLUGIN_DIRECTORY", optimizer_root), mock.patch.object(
+                vlm, "PROMPT_GENERATOR_ENV", generator_env
+            ), mock.patch.dict(vlm.os.environ, {}, clear=True):
+                self.assertEqual(
+                    vlm.optimizer_setting("LLAMA_MODEL_PATH"),
+                    "/optimizer/model.gguf",
+                )
+                vlm.os.environ["MINIMAX_LLAMA_MODEL_PATH"] = "/process/shared.gguf"
+                self.assertEqual(
+                    vlm.optimizer_setting("LLAMA_MODEL_PATH"),
+                    "/process/shared.gguf",
+                )
+                vlm.os.environ["H3_OPTIMIZER_LLAMA_MODEL_PATH"] = "/process/optimizer.gguf"
+                self.assertEqual(
+                    vlm.optimizer_setting("LLAMA_MODEL_PATH"),
+                    "/process/optimizer.gguf",
+                )
+
+            self.assertEqual(optimizer_env.read_text(encoding="utf-8"), optimizer_text)
+            self.assertEqual(generator_env.read_text(encoding="utf-8"), generator_text)
+
+    def test_llama_cli_request_uses_json_grammar_images_and_temporary_files(self):
+        vlm = plugin_module("vlm")
+
+        config = vlm.LlamaCliConfig(
+            cli_path=Path("/opt/llama/llama-cli"),
+            model_path=Path("/models/vlm.gguf"),
+            mmproj_path=Path("/models/mmproj.gguf"),
+            device="CUDA0",
+            gpu_layers="auto",
+            ctx_size=32768,
+            fit_target_mib=1024,
+            image_max_tokens=768,
+            timeout_seconds=30,
+        )
+        jpeg = b"fake jpeg bytes"
+        messages = [{
+            "role": "system",
+            "content": "Return JSON.",
+        }, {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Review the frame."},
+                {"type": "text", "text": "Frame timestamp: 1.250 seconds"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+                    },
+                },
+            ],
+        }]
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+            returncode = None
+
+            async def communicate(self):
+                self.returncode = 0
+                return b"console output", b"llama diagnostic"
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def start_process(*command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            system_path = Path(command[command.index("--system-prompt-file") + 1])
+            prompt_path = Path(command[command.index("--file") + 1])
+            output_path = Path(command[command.index("--output-file") + 1])
+            grammar_path = Path(command[command.index("--grammar-file") + 1])
+            image_path = Path(command[command.index("--image") + 1])
+            captured["temporary_directory"] = prompt_path.parent
+            captured["system"] = system_path.read_text(encoding="utf-8")
+            captured["prompt"] = prompt_path.read_text(encoding="utf-8")
+            output_path.write_text(
+                'prompt transcript\n\nAssistant:\n{"status":"ok"}', encoding="utf-8"
+            )
+            captured["grammar"] = grammar_path.read_text(encoding="utf-8")
+            captured["image"] = image_path.read_bytes()
+            return FakeProcess()
+
+        with mock.patch.object(
+            vlm.asyncio, "create_subprocess_exec", new=start_process
+        ), mock.patch.object(vlm, "_comfy_queue_busy", return_value=False):
+            output = asyncio.run(
+                vlm._request_llama_cli(messages, 512, config)
+            )
+
+        self.assertEqual(output.content, '{"status":"ok"}')
+        self.assertEqual(output.diagnostics, "llama diagnostic")
+        self.assertEqual(captured["system"], "Return JSON.")
+        self.assertIn("Image 1: 1.250 seconds", captured["prompt"])
+        self.assertIn("root ::= object", captured["grammar"])
+        self.assertEqual(captured["image"], jpeg)
+        self.assertIn("--single-turn", captured["command"])
+        self.assertIn("--offline", captured["command"])
+        self.assertIn("--output-file", captured["command"])
+        self.assertIn("--grammar-file", captured["command"])
+        self.assertNotIn("--json-schema-file", captured["command"])
+        self.assertIn("--mmproj", captured["command"])
+        self.assertTrue(captured["kwargs"]["start_new_session"])
+        self.assertFalse(captured["temporary_directory"].exists())
+
+    def test_invalid_structured_responses_log_content_and_backend_diagnostics(self):
+        from pydantic import BaseModel
+
+        vlm = plugin_module("vlm")
+
+        class ProbeResult(BaseModel):
+            status: str
+
+        responses = [
+            vlm.VLMResponse("initial non-JSON output", "initial llama stderr"),
+            vlm.VLMResponse("repair non-JSON output", "repair llama stderr"),
+        ]
+        with mock.patch.object(vlm, "_request", side_effect=responses), self.assertLogs(
+            vlm.log, level="WARNING"
+        ) as captured:
+            with self.assertRaisesRegex(ValueError, "VLM response is not valid JSON"):
+                asyncio.run(vlm.generate_structured("system", "user", [], ProbeResult))
+
+        messages = "\n".join(captured.output)
+        self.assertIn("ProbeResult response is invalid during initial generation", messages)
+        self.assertIn("initial non-JSON output", messages)
+        self.assertIn("initial llama stderr", messages)
+        self.assertIn("ProbeResult response is invalid during repair generation", messages)
+        self.assertIn("repair non-JSON output", messages)
+        self.assertIn("repair llama stderr", messages)
+
+    def test_llama_cli_empty_response_logs_context_and_timings(self):
+        vlm = plugin_module("vlm")
+
+        config = vlm.LlamaCliConfig(
+            Path("/cli"), Path("/model"), Path("/mmproj"), "CUDA0", "auto",
+            65536, None, None, 30,
+        )
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+            returncode = None
+
+            async def communicate(self):
+                self.returncode = 0
+                return b"", b"[ Prompt: 12.0 t/s | Generation: 0.0 t/s ]"
+
+        async def start_process(*command, **_kwargs):
+            captured["command"] = command
+            output_path = Path(command[command.index("--output-file") + 1])
+            output_path.write_text("User:\nrequest\n\nAssistant:\n\n", encoding="utf-8")
+            return FakeProcess()
+
+        with mock.patch.object(
+            vlm.asyncio, "create_subprocess_exec", new=start_process
+        ), mock.patch.object(vlm, "_comfy_queue_busy", return_value=False), self.assertLogs(
+            vlm.log, level="ERROR"
+        ) as logs:
+            with self.assertRaisesRegex(vlm.VLMProcessError, "no assistant content"):
+                asyncio.run(vlm._request_llama_cli(
+                    [{"role": "user", "content": "request"}], 4096, config
+                ))
+
+        message = "\n".join(logs.output)
+        self.assertIn("images=0, max_tokens=4096, ctx_size=65536", message)
+        self.assertIn("Generation: 0.0 t/s", message)
+        self.assertNotIn("--no-show-timings", captured["command"])
+
+    def test_local_inference_session_unloads_comfy_models_once(self):
+        vlm = plugin_module("vlm")
+        config = vlm.LlamaCliConfig(
+            Path("/cli"), Path("/model"), Path("/mmproj"), "CUDA0", "auto",
+            None, None, None, 300,
+        )
+
+        async def enter_session():
+            async with vlm.inference_session():
+                self.assertEqual(vlm._ACTIVE_BACKEND.get(), "llama_cli")
+                self.assertIs(vlm._ACTIVE_LLAMA_CONFIG.get(), config)
+
+        with mock.patch.object(
+            vlm, "vlm_backend", return_value="llama_cli"
+        ), mock.patch.object(
+            vlm, "_llama_cli_config", return_value=config
+        ), mock.patch.object(
+            vlm, "_comfy_queue_busy", return_value=False
+        ), mock.patch.object(
+            vlm.comfy.model_management, "unload_all_models"
+        ) as unload, mock.patch.object(
+            vlm.comfy.model_management, "soft_empty_cache"
+        ) as empty_cache:
+            asyncio.run(enter_session())
+
+        unload.assert_called_once_with()
+        empty_cache.assert_called_once_with()
+        self.assertIsNone(vlm._ACTIVE_BACKEND.get())
+        self.assertIsNone(vlm._ACTIVE_LLAMA_CONFIG.get())
+
+    def test_cancelling_llama_cli_request_stops_the_process(self):
+        vlm = plugin_module("vlm")
+
+        with tempfile.TemporaryDirectory() as directory:
+            cli = Path(directory) / "llama-cli"
+            cli.write_text("#!/bin/sh\nsleep 60\n", encoding="utf-8")
+            cli.chmod(0o700)
+            config = vlm.LlamaCliConfig(
+                cli, Path("/model"), Path("/mmproj"), "CUDA0", "auto",
+                None, None, None, 300,
+            )
+            started = asyncio.Event()
+            process = None
+            create_subprocess = asyncio.create_subprocess_exec
+
+            async def start_process(*command, **kwargs):
+                nonlocal process
+                process = await create_subprocess(*command, **kwargs)
+                started.set()
+                return process
+
+            async def cancel_request():
+                task = asyncio.create_task(
+                    vlm._request_llama_cli(
+                        [{"role": "user", "content": "wait"}], 16, config
+                    )
+                )
+                await started.wait()
+                await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            with mock.patch.object(
+                vlm.asyncio, "create_subprocess_exec", new=start_process
+            ), mock.patch.object(vlm, "_comfy_queue_busy", return_value=False):
+                asyncio.run(cancel_request())
+
+            self.assertIsNotNone(process.returncode)
 
 
 class EngineTests(unittest.TestCase):
