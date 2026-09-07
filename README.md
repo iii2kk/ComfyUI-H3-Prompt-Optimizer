@@ -66,6 +66,8 @@ H3 Optimizer Ref2VA Prompt Package Generator.prompt_state
 
 `project_name`、`segment_id`、`resume_from`、`continuation_frame_count`、`blend_frames`はSettingsを設定元とします。複数segmentではSegmentごとにSettingsノードを1つ配置してください。先頭Segmentは通常 `continuation_frame_count=22 / blend_frames=0`、後続Segmentは `22 / 5` とし、後続Segmentだけ `continuation_frame_count` をCheckpointの `trim_frames` にも接続します。Sidebarの`Apply & Generate`は、接続されたSettingsの`resume_from`を更新します。
 
+`H3 Optimizer Ref2VA Prompt Package Generator`には`reasoning_effort`ウィジェットがあり、`none`、`low`、`medium`、`xhigh`を選択できます。`none`はreasoningを無効にし、その他の値はLLMサーバーまたはチャットテンプレートへ渡します。
+
 Checkpoint が LOAD する segment では Video Output は `prompt_state` を評価しません。GENERATE された segment だけを Registry に登録します。Checkpoint が過去 revision を整理してもレビュー履歴が消えないよう、動画は `output/h3_prompt_optimizer/artifacts/` に独立保存されます。
 
 `H3 Optimizer Video Output`は、登録した動画ごとに次の再生成情報も同じartifactディレクトリへ保存します。
@@ -117,6 +119,12 @@ CLI方式では、チャットテンプレートの生成prefixと`llama.cpp`の
 4. 低品質プレビューから高品質版を作る場合は`生成条件を復元`後、解像度とsampler stepsだけを変更してQueueする。
 5. Promptを改善する場合は、改善点と必要なら開始秒・終了秒を入力して`動画を解析`を押す。
 6. 観測結果、提案 action、Prompt 差分を確認し、`Apply`または`Apply & Generate`を押す。
+
+サイドバーの`Reasoning effort`で、解析リクエストごとのreasoning強度を指定できます。選択値はその解析にだけ適用され、保存されません。
+
+`Max tokens`は既定で自動です。`none` / `low` / `medium` / `xhigh`に対して、それぞれ4096 / 8192 / 12288 / 16384を適用し、画面に表示します。「手動」では正の整数を指定でき、effortを変更しても手動値を保持します。設定はページ内のみで保持します。
+
+上限は推論と最終回答を含むLLM呼び出し1回ごとの値で、全体・区間解析、改善案生成、JSON修復に共通です。APIの`max_tokens`は省略・`null`なら自動、正の整数なら手動指定です。プリセットは必要量を保証しません。OpenAI互換サーバーが`finish_reason=length`を返した場合は上限と変更案をエラー表示します。CLIの空回答だけから上限到達とは判定しません。
 
 同じPrompt・seedでも、解像度やstepsを変更すると拡散計算そのものが変わるため、低品質版とフレーム単位で同一の動画にはなりません。完全な再現には、保存した条件に加えてモデルファイル、参照素材、ComfyUI/custom node、計算backendも同じである必要があります。
 

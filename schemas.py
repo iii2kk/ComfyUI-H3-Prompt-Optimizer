@@ -3,6 +3,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+ANALYSIS_MAX_TOKENS = {"none": 4096, "low": 8192, "medium": 12288, "xhigh": 16384}
+
+
 class ReviewTimeRange(BaseModel):
     start_sec: float = Field(ge=0)
     end_sec: float = Field(gt=0)
@@ -21,6 +24,12 @@ class AnalyzeRequest(BaseModel):
     feedback: str = Field(min_length=1, max_length=8000)
     time_range: ReviewTimeRange | None = None
     target_state_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reasoning_effort: Literal["none", "low", "medium", "xhigh"] = "none"
+    max_tokens: int | None = Field(default=None, gt=0, strict=True)
+
+    @property
+    def resolved_max_tokens(self):
+        return self.max_tokens if self.max_tokens is not None else ANALYSIS_MAX_TOKENS[self.reasoning_effort]
 
 
 class Observation(BaseModel):

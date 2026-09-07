@@ -198,6 +198,7 @@ class NodeContractTests(unittest.TestCase):
                     duration_seconds=5,
                     optimizer_id="segment_1",
                     seed=42,
+                    reasoning_effort="low",
                     ref_images={"ref_image_0": image},
                 )
             )
@@ -206,6 +207,9 @@ class NodeContractTests(unittest.TestCase):
         self.assertIs(
             generator_execute.await_args.kwargs["ref_images"]["ref_image_0"],
             image,
+        )
+        self.assertEqual(
+            generator_execute.await_args.kwargs["reasoning_effort"], "low"
         )
         self.assertEqual(output[0], PROMPT)
         self.assertEqual(output[1]["prompt"], PROMPT)
@@ -376,6 +380,10 @@ class NodeContractTests(unittest.TestCase):
         combined_inputs = {item.id: item for item in combined_schema.inputs}
         combined_outputs = {item.id: item for item in combined_schema.outputs}
         self.assertEqual(combined_inputs["max_tokens"].max, 65536)
+        self.assertEqual(
+            combined_inputs["reasoning_effort"].options,
+            ["none", "low", "medium", "xhigh"],
+        )
         self.assertIn("continuation_frames", combined_inputs)
         self.assertIn("raw_frames", combined_outputs)
         self.assertEqual(
@@ -663,12 +671,64 @@ class SchemaTests(unittest.TestCase):
         )
         self.assertEqual(request.generation_id, "generation_1")
         self.assertEqual(request.feedback, "fix the motion")
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertEqual(
+            schemas.AnalyzeRequest(
+                generation_id="generation_1",
+                feedback="fix",
+                target_state_hash="a" * 64,
+                reasoning_effort="xhigh",
+            ).reasoning_effort,
+            "xhigh",
+        )
         with self.assertRaises(ValueError):
             schemas.AnalyzeRequest(
                 generation_id="generation_1",
                 feedback="fix",
                 target_state_hash="z" * 64,
             )
+        with self.assertRaises(ValueError):
+            schemas.AnalyzeRequest(
+                generation_id="generation_1",
+                feedback="fix",
+                target_state_hash="a" * 64,
+                reasoning_effort="high",
+            )
+
+    def test_analysis_token_budget_defaults_and_manual_validation(self):
+        schemas = plugin_module("schemas")
+        inputs = dict(generation_id="generation_1", feedback="fix", target_state_hash="a" * 64)
+        self.assertEqual(schemas.AnalyzeRequest(**inputs).resolved_max_tokens, 4096)
+        for effort, expected in [("none", 4096), ("low", 8192), ("medium", 12288), ("xhigh", 16384)]:
+            request = schemas.AnalyzeRequest(**inputs, reasoning_effort=effort, max_tokens=None)
+            self.assertEqual(request.resolved_max_tokens, expected)
+            request = schemas.AnalyzeRequest(**inputs, reasoning_effort=effort, max_tokens=23456)
+            self.assertEqual(request.resolved_max_tokens, 23456)
+        for invalid in [0, -1, 1.5, 4096.0, "8192", True, False]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                schemas.AnalyzeRequest(**inputs, max_tokens=invalid)
+
+    def test_frame_analysis_passes_budget_to_global_and_focused_calls(self):
+        engine = plugin_module("engine")
+        schemas = plugin_module("schemas")
+        critic = types.SimpleNamespace(
+            issue_type="motion_timing",
+            localization=schemas.Localization(start_sec=1, end_sec=2),
+            model_dump=lambda: {},
+        )
+        for requested_range, expected_calls in [(None, 2), ({"start_sec": 1, "end_sec": 2}, 1)]:
+            generate = mock.AsyncMock(return_value=critic)
+            with mock.patch.object(engine, "sample_video", return_value=[]), \
+                 mock.patch.object(engine, "_critic_user_prompt", return_value="review"), \
+                 mock.patch.object(engine, "generate_structured", new=generate):
+                asyncio.run(engine._analyze_frames(
+                    {"video": {"duration_sec": 5}}, "fix", requested_range,
+                    Path("/video"), "medium", 23456,
+                ))
+            self.assertEqual(generate.await_count, expected_calls)
+            for call in generate.await_args_list:
+                self.assertEqual(call.kwargs["max_tokens"], 23456)
+                self.assertEqual(call.kwargs["reasoning_effort"], "medium")
 
     def test_vlm_parser_accepts_server_channel_prefix(self):
         from pydantic import BaseModel
@@ -684,6 +744,30 @@ class SchemaTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "ok")
 
+    def test_vlm_parser_removes_llama_cli_reasoning_before_json_candidates(self):
+        from pydantic import BaseModel
+
+        vlm = plugin_module("vlm")
+
+        class ProbeResult(BaseModel):
+            status: str
+
+        result = vlm._decode_json(
+            "[Start thinking]\n{\"status\":\"wrong\"}\n[End thinking]\n"
+            "{\"status\":\"ok\"}",
+            ProbeResult,
+        )
+        self.assertEqual(result.status, "ok")
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            vlm._decode_json(
+                "[Start thinking]\n{\"status\":\"wrong\"}\n[End thinking]\nnot json",
+                ProbeResult,
+            )
+        with self.assertRaisesRegex(ValueError, "unterminated"):
+            vlm._decode_json("[Start thinking]\nprivate", ProbeResult)
+        with self.assertRaisesRegex(ValueError, "empty final"):
+            vlm._decode_json("[Start thinking]\nprivate[End thinking]", ProbeResult)
+
 
 class VLMBackendTests(unittest.TestCase):
     def test_llama_cli_lock_is_shared_with_prompt_generator(self):
@@ -692,6 +776,80 @@ class VLMBackendTests(unittest.TestCase):
             "custom_nodes.ComfyUI-MiniMaxH3-Prompt-Generator.llama_cli"
         )
         self.assertIs(vlm._LLAMA_SESSION_LOCK, adapter.SESSION_LOCK)
+
+    def test_llama_cli_reasoning_effort_command_mapping(self):
+        vlm = plugin_module("vlm")
+        config = vlm.LlamaCliConfig(
+            Path("/cli"), Path("/model"), Path("/mmproj"), "CUDA0", "auto",
+            None, None, None, 30,
+        )
+        for effort in ("none", "low", "medium", "xhigh"):
+            command = vlm._llama_cli_command(
+                config,
+                Path("/system"),
+                Path("/prompt"),
+                Path("/output"),
+                Path("/grammar"),
+                [],
+                512,
+                effort,
+            )
+            self.assertEqual(command[command.index("--predict") + 1], "512")
+            if effort == "none":
+                self.assertEqual(command[command.index("--reasoning") + 1], "off")
+                self.assertNotIn("--reasoning-effort", command)
+            else:
+                self.assertEqual(
+                    command[command.index("--reasoning-effort") + 1], effort
+                )
+                self.assertNotIn("--reasoning", command)
+
+    def test_openai_request_includes_reasoning_effort(self):
+        vlm = plugin_module("vlm")
+        captured = {}
+        response_choice = {"message": {"content": "{}"}}
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def text(self):
+                return json.dumps({"choices": [response_choice]})
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, url, **kwargs):
+                captured["url"] = url
+                captured.update(kwargs)
+                return FakeResponse()
+
+        with mock.patch.object(vlm.aiohttp, "ClientSession", return_value=FakeSession()), \
+             mock.patch.object(vlm, "chat_completions_url", return_value="http://llm/v1/chat/completions"):
+            response = asyncio.run(
+                vlm._request_openai([{"role": "user", "content": "review"}], 512, "medium")
+            )
+            for content in (None, "", "{}"):
+                response_choice.update(finish_reason="length", message={"content": content})
+                with self.assertRaisesRegex(ValueError, "max_tokens=512.*reasoning_effort=medium"):
+                    asyncio.run(vlm._request_openai([], 512, "medium"))
+            response_choice.update(finish_reason="stop", message={"content": ""})
+            with self.assertRaisesRegex(ValueError, "returned no content"):
+                asyncio.run(vlm._request_openai([], 512, "medium"))
+
+        self.assertEqual(response.content, "{}")
+        self.assertEqual(captured["url"], "http://llm/v1/chat/completions")
+        self.assertEqual(captured["json"]["reasoning_effort"], "medium")
+        self.assertEqual(captured["json"]["max_tokens"], 512)
 
     def test_legacy_llama_cli_settings_are_loaded_from_plugin_env(self):
         vlm = plugin_module("vlm")
@@ -874,7 +1032,7 @@ class VLMBackendTests(unittest.TestCase):
             vlm.asyncio, "create_subprocess_exec", new=start_process
         ), mock.patch.object(vlm, "_comfy_queue_busy", return_value=False):
             output = asyncio.run(
-                vlm._request_llama_cli(messages, 512, config)
+                vlm._request_llama_cli(messages, 512, config, "none")
             )
 
         self.assertEqual(output.content, '{"status":"ok"}')
@@ -918,6 +1076,30 @@ class VLMBackendTests(unittest.TestCase):
         self.assertIn("repair non-JSON output", messages)
         self.assertIn("repair llama stderr", messages)
 
+    def test_generate_structured_propagates_reasoning_effort_to_repair(self):
+        from pydantic import BaseModel
+
+        vlm = plugin_module("vlm")
+
+        class ProbeResult(BaseModel):
+            status: str
+
+        request = mock.AsyncMock(side_effect=[
+            vlm.VLMResponse("not json"),
+            vlm.VLMResponse('{"status":"ok"}'),
+        ])
+        with mock.patch.object(vlm, "_request", new=request):
+            result = asyncio.run(
+                vlm.generate_structured(
+                    "system", "user", [], ProbeResult, max_tokens=23456, reasoning_effort="xhigh"
+                )
+            )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(request.await_count, 2)
+        self.assertEqual([call.args[1] for call in request.await_args_list], [23456, 23456])
+        self.assertEqual([call.args[2] for call in request.await_args_list], ["xhigh", "xhigh"])
+
     def test_llama_cli_empty_response_logs_context_and_timings(self):
         vlm = plugin_module("vlm")
 
@@ -948,7 +1130,7 @@ class VLMBackendTests(unittest.TestCase):
         ) as logs:
             with self.assertRaisesRegex(vlm.VLMProcessError, "no assistant content"):
                 asyncio.run(vlm._request_llama_cli(
-                    [{"role": "user", "content": "request"}], 4096, config
+                    [{"role": "user", "content": "request"}], 4096, config, "none"
                 ))
 
         message = "\n".join(logs.output)
@@ -1010,7 +1192,7 @@ class VLMBackendTests(unittest.TestCase):
             async def cancel_request():
                 task = asyncio.create_task(
                     vlm._request_llama_cli(
-                        [{"role": "user", "content": "wait"}], 16, config
+                        [{"role": "user", "content": "wait"}], 16, config, "none"
                     )
                 )
                 await started.wait()
@@ -1111,7 +1293,7 @@ class EngineTests(unittest.TestCase):
                 engine,
                 "_analyze_frames",
                 new=mock.AsyncMock(return_value=critic),
-            ), mock.patch.object(
+            ) as analyze_frames, mock.patch.object(
                 engine,
                 "generate_structured",
                 new=mock.AsyncMock(return_value=patch),
@@ -1123,10 +1305,19 @@ class EngineTests(unittest.TestCase):
                     generation_id=generation["generation_id"],
                     feedback="Keep the pom-pom on the bed and show socks, not boots.",
                     target_state_hash="a" * 64,
+                    reasoning_effort="xhigh",
                 )
                 result = asyncio.run(engine.analyze_generation(request))
 
         self.assertEqual(planner.await_count, 1)
+        self.assertEqual(analyze_frames.await_args.kwargs["max_tokens"], 16384)
+        self.assertEqual(planner.await_args.kwargs["max_tokens"], 16384)
+        self.assertEqual(
+            analyze_frames.await_args.kwargs["reasoning_effort"], "xhigh"
+        )
+        self.assertEqual(
+            planner.await_args.kwargs["reasoning_effort"], "xhigh"
+        )
         planner_input = json.loads(planner.await_args.args[1])
         self.assertEqual(planner_input["critic"]["root_cause"], "MODEL_CAPABILITY_LIMIT")
         self.assertIn("/sections/subject_definitions", planner_input["allowed_paths"])
@@ -1186,9 +1377,13 @@ class EngineTests(unittest.TestCase):
                     generation_id=generation["generation_id"],
                     feedback="The walking motion is too fast.",
                     target_state_hash="a" * 64,
+                    reasoning_effort="medium",
+                    max_tokens=23456,
                 )
                 result = asyncio.run(engine.analyze_generation(request))
 
+                self.assertEqual(engine._analyze_frames.await_args.kwargs["max_tokens"], 23456)
+                self.assertEqual(engine.generate_structured.await_args.kwargs["max_tokens"], 23456)
                 self.assertEqual(result["proposal"]["action"], "PATCH_PROMPT")
                 self.assertIn("over three seconds", result["optimized_prompt"])
                 self.assertIn("<Picture 1> defines her identity", result["optimized_prompt"])
@@ -1231,6 +1426,11 @@ class PackageLoadTests(unittest.TestCase):
             self.assertEqual(len(PromptServer.instance.routes), 10)
 
             route_module = sys.modules[module_name + ".routes"]
+            with mock.patch.object(route_module, "backend_status", return_value={}):
+                status = asyncio.run(route_module.optimizer_status(None))
+            self.assertEqual(json.loads(status.text)["analysis_max_tokens"], {
+                "none": 4096, "low": 8192, "medium": 12288, "xhigh": 16384,
+            })
 
             async def check_cancel():
                 started = asyncio.Event()

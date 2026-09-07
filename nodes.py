@@ -373,6 +373,12 @@ class H3OptimizerRef2VAPromptPackageGenerator(io.ComfyNode):
                 io.Int.Input(
                     "max_video_frames", default=8, min=2, max=32, advanced=True,
                 ),
+                io.Combo.Input(
+                    "reasoning_effort",
+                    options=["none", "low", "medium", "xhigh"],
+                    default="none",
+                    advanced=True,
+                ),
             ],
             outputs=[
                 io.String.Output("prompt", display_name="Effective prompt"),
@@ -388,7 +394,7 @@ class H3OptimizerRef2VAPromptPackageGenerator(io.ComfyNode):
                       approved_prompt="", seed=0, temperature=1.0, top_p=0.95,
                       max_tokens=4096, timeout_seconds=300, max_image_edge=1024,
                       max_video_frames=8, ref_images=None, ref_videos=None,
-                      ref_video_audios=None, ref_audios=None,
+                      reasoning_effort="none", ref_video_audios=None, ref_audios=None,
                       continuation_frames=None):
         optimizer_id = _optimizer_id(optimizer_id)
         if use_approved_prompt:
@@ -419,6 +425,7 @@ class H3OptimizerRef2VAPromptPackageGenerator(io.ComfyNode):
             timeout_seconds=timeout_seconds,
             max_image_edge=max_image_edge,
             max_video_frames=max_video_frames,
+            reasoning_effort=reasoning_effort,
             ref_images=ref_images,
             ref_videos=ref_videos,
             ref_video_audios=ref_video_audios,

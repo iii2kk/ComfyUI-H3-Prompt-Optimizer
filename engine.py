@@ -121,7 +121,9 @@ def _critic_user_prompt(generation, feedback, requested_range, previous=None):
     return "\n".join(parts)
 
 
-async def _analyze_frames(generation, feedback, requested_range, path, cancel_event=None):
+async def _analyze_frames(
+    generation, feedback, requested_range, path, reasoning_effort, max_tokens, cancel_event=None
+):
     duration = generation["video"]["duration_sec"]
     if requested_range:
         start = max(0.0, requested_range["start_sec"] - 0.5)
@@ -134,6 +136,8 @@ async def _analyze_frames(generation, feedback, requested_range, path, cancel_ev
             _critic_user_prompt(generation, feedback, requested_range),
             frames,
             CriticResult,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
         )
 
     frames = await asyncio.to_thread(
@@ -144,6 +148,8 @@ async def _analyze_frames(generation, feedback, requested_range, path, cancel_ev
         _critic_user_prompt(generation, feedback, None),
         frames,
         CriticResult,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
     )
     if global_result.issue_type not in TEMPORAL_ISSUES or global_result.localization is None:
         return global_result
@@ -164,6 +170,8 @@ async def _analyze_frames(generation, feedback, requested_range, path, cancel_ev
         ),
         focused_frames,
         CriticResult,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -180,6 +188,7 @@ def _non_patch_plan(critic):
 
 
 async def analyze_generation(request, cancel_event=None):
+    max_tokens = request.resolved_max_tokens
     generation = get_generation(request.generation_id)
     if generation is None:
         raise ValueError("Generation was not found.")
@@ -204,7 +213,13 @@ async def analyze_generation(request, cancel_event=None):
         raise ValueError("Generation artifact is missing.")
     async with inference_session():
         critic = await _analyze_frames(
-            generation, request.feedback.strip(), requested_range, artifact_path, cancel_event
+            generation,
+            request.feedback.strip(),
+            requested_range,
+            artifact_path,
+            reasoning_effort=request.reasoning_effort,
+            max_tokens=max_tokens,
+            cancel_event=cancel_event,
         )
 
         patch = _non_patch_plan(critic)
@@ -222,6 +237,8 @@ async def analyze_generation(request, cancel_event=None):
                 json.dumps(planner_input, ensure_ascii=False),
                 [],
                 PatchPlan,
+                max_tokens=max_tokens,
+                reasoning_effort=request.reasoning_effort,
             )
 
     if patch.action == "PATCH_PROMPT":

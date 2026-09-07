@@ -269,12 +269,28 @@ def chat_completions_url():
 
 
 def _strip_response(text):
-    value = (text or "").strip()
-    if "</think>" in value:
+    value = (text or "").strip().lstrip("\ufeff").strip()
+    wrappers = (
+        ("<think>", "</think>"),
+        ("<|channel>thought", "<channel|>"),
+        ("[Start thinking]", "[End thinking]"),
+    )
+    matched_wrapper = False
+    for opener, closer in wrappers:
+        if not value.startswith(opener):
+            continue
+        matched_wrapper = True
+        end = value.find(closer, len(opener))
+        if end < 0:
+            raise ValueError("VLM response has an unterminated reasoning block.")
+        value = value[end + len(closer):].strip()
+    if not matched_wrapper and "</think>" in value:
         value = value.split("</think>", 1)[1].strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", value, re.DOTALL | re.IGNORECASE)
     if fenced:
         value = fenced.group(1).strip()
+    if not value:
+        raise ValueError("VLM response has an empty final response.")
     return value
 
 
@@ -328,26 +344,27 @@ def _message_content(user_text, images):
     return content
 
 
-async def _request(messages, max_tokens):
+async def _request(messages, max_tokens, reasoning_effort):
     backend = _ACTIVE_BACKEND.get()
     if backend is None:
         async with inference_session():
-            return await _request(messages, max_tokens)
+            return await _request(messages, max_tokens, reasoning_effort)
     if backend == LLAMA_CLI_BACKEND:
         config = _ACTIVE_LLAMA_CONFIG.get()
         if config is None:
             raise VLMConfigurationError("The llama-cli inference session is not initialized.")
-        return await _request_llama_cli(messages, max_tokens, config)
-    return await _request_openai(messages, max_tokens)
+        return await _request_llama_cli(messages, max_tokens, config, reasoning_effort)
+    return await _request_openai(messages, max_tokens, reasoning_effort)
 
 
-async def _request_openai(messages, max_tokens):
+async def _request_openai(messages, max_tokens, reasoning_effort):
     payload = {
         "messages": messages,
         "temperature": 0.1,
         "top_p": 0.9,
         "max_tokens": int(max_tokens),
         "stream": False,
+        "reasoning_effort": reasoning_effort,
     }
     model = optimizer_only_setting("MODEL")
     if model:
@@ -366,9 +383,17 @@ async def _request_openai(messages, max_tokens):
                     raise ValueError("H3 Prompt Optimizer VLM HTTP %d: %s" % (response.status, body[:800]))
                 try:
                     data = json.loads(body)
-                    content = data["choices"][0]["message"]["content"]
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                    choice = data["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    content = choice["message"].get("content")
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError) as error:
                     raise ValueError("H3 Prompt Optimizer VLM returned an unexpected response shape.") from error
+                if finish_reason == "length":
+                    raise ValueError(
+                        "VLM reached max_tokens=%d (reasoning_effort=%s). "
+                        "Increase Max tokens or lower Reasoning effort."
+                        % (max_tokens, reasoning_effort)
+                    )
                 if not isinstance(content, str) or not content.strip():
                     raise ValueError("H3 Prompt Optimizer VLM returned no content.")
                 return VLMResponse(content)
@@ -437,7 +462,7 @@ def _llama_cli_messages(messages):
 
 
 def _llama_cli_command(config, system_path, prompt_path, output_path, grammar_path,
-                       image_paths, max_tokens):
+                       image_paths, max_tokens, reasoning_effort):
     command = [
         str(config.cli_path),
         "--offline",
@@ -458,12 +483,15 @@ def _llama_cli_command(config, system_path, prompt_path, output_path, grammar_pa
         "--temperature", "0.1",
         "--top-p", "0.9",
         "--predict", str(int(max_tokens)),
-        "--reasoning", "off",
         "--no-display-prompt",
         "--color", "off",
         "--log-colors", "off",
         "--log-verbosity", "1",
     ])
+    if reasoning_effort == "none":
+        command.extend(("--reasoning", "off"))
+    else:
+        command.extend(("--reasoning-effort", reasoning_effort))
     if config.ctx_size is not None:
         command.extend(("--ctx-size", str(config.ctx_size)))
     if config.fit_target_mib is not None:
@@ -508,7 +536,7 @@ async def _terminate_process(process, communication=None):
     return await asyncio.shield(waiter)
 
 
-async def _request_llama_cli(messages, max_tokens, config):
+async def _request_llama_cli(messages, max_tokens, config, reasoning_effort):
     if _comfy_queue_busy():
         raise VLMBackendBusyError(
             "A ComfyUI job was queued during local llama-cli analysis."
@@ -530,7 +558,14 @@ async def _request_llama_cli(messages, max_tokens, config):
             image_paths.append(image_path)
 
         command = _llama_cli_command(
-            config, system_path, prompt_path, output_path, grammar_path, image_paths, max_tokens
+            config,
+            system_path,
+            prompt_path,
+            output_path,
+            grammar_path,
+            image_paths,
+            max_tokens,
+            reasoning_effort,
         )
         process_kwargs = {
             "stdout": asyncio.subprocess.PIPE,
@@ -606,12 +641,14 @@ def _log_invalid_response(stage, schema, response, error):
     )
 
 
-async def generate_structured(system_prompt, user_text, images, schema, max_tokens=4096):
+async def generate_structured(
+    system_prompt, user_text, images, schema, max_tokens=4096, reasoning_effort="none"
+):
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": _message_content(user_text, images)},
     ]
-    response = await _request(messages, max_tokens)
+    response = await _request(messages, max_tokens, reasoning_effort)
     try:
         return _decode_json(response.content, schema)
     except ValueError as initial_error:
@@ -627,7 +664,7 @@ async def generate_structured(system_prompt, user_text, images, schema, max_toke
                 ),
             },
         ]
-        repaired = await _request(repair_messages, max_tokens)
+        repaired = await _request(repair_messages, max_tokens, reasoning_effort)
         try:
             return _decode_json(repaired.content, schema)
         except ValueError as repair_error:

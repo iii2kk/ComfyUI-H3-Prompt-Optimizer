@@ -144,8 +144,22 @@ async function refreshBackendStatus() {
         const status = await requestJson("/h3_optimizer/status");
         const backend = status.critic_backend === "llama_cli" ? "local llama-cli" : "OpenAI-compatible";
         panel.backend.textContent = `VLM: ${backend} / ${status.critic_model}`;
+        panel.tokenPresets = status.analysis_max_tokens;
+        updateMaxTokens();
     } catch (error) {
         panel.backend.textContent = `VLM設定エラー: ${error.message}`;
+    }
+}
+
+
+function updateMaxTokens() {
+    const automatic = panel.maxTokensMode.value === "auto";
+    const preset = panel.tokenPresets?.[panel.reasoningEffort.value];
+    panel.maxTokensMode.options[0].textContent = preset ? `自動：${preset}` : "自動";
+    panel.maxTokens.hidden = automatic;
+    panel.maxTokens.disabled = automatic;
+    if (!automatic && !panel.maxTokens.value) {
+        panel.maxTokens.value = preset ?? "";
     }
 }
 
@@ -415,6 +429,14 @@ async function analyze() {
             timeRange = {start_sec: start, end_sec: end};
         }
 
+        let maxTokens = null;
+        if (panel.maxTokensMode.value === "manual") {
+            maxTokens = Number(panel.maxTokens.value);
+            if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) {
+                throw new Error("Max tokensは正の整数で入力してください。");
+            }
+        }
+
         currentAnalysis = null;
         panel.analysis.replaceChildren();
         panel.apply.disabled = true;
@@ -436,6 +458,8 @@ async function analyze() {
                 feedback,
                 time_range: timeRange,
                 target_state_hash: UNTRACKED_STATE_HASH,
+                reasoning_effort: panel.reasoningEffort.value,
+                max_tokens: maxTokens,
             }),
         });
         renderAnalysis(currentAnalysis);
@@ -617,7 +641,31 @@ function renderSidebar(root) {
     const range = document.createElement("div");
     range.className = "h3-optimizer-range";
     range.append(labeledInput("開始秒", start), labeledInput("終了秒", end));
+    const reasoningEffort = document.createElement("select");
+    for (const value of ["none", "low", "medium", "xhigh"]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        reasoningEffort.append(option);
+    }
     const analyzeButton = button("動画を解析", analyze);
+    const maxTokensMode = document.createElement("select");
+    for (const [value, text] of [["auto", "自動"], ["manual", "手動"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        maxTokensMode.append(option);
+    }
+    const maxTokens = document.createElement("input");
+    maxTokens.type = "number";
+    maxTokens.min = "1";
+    maxTokens.step = "1";
+    maxTokens.setAttribute("aria-label", "Max tokens（手動）");
+    const tokenSettings = document.createElement("div");
+    tokenSettings.append(maxTokensMode, maxTokens);
+    const tokenHelp = document.createElement("small");
+    tokenHelp.textContent = "推論と最終回答を含む、LLM呼び出し1回ごとの上限です。";
+    tokenSettings.append(tokenHelp);
     const analysis = document.createElement("section");
     analysis.className = "h3-optimizer-analysis";
     const apply = button("Apply", () => applyAnalysis(false));
@@ -640,6 +688,8 @@ function renderSidebar(root) {
         settings,
         promptDetails,
         restoreActions,
+        labeledInput("Reasoning effort", reasoningEffort),
+        labeledInput("Max tokens", tokenSettings),
         labeledInput("改善したい点", feedback),
         range,
         analyzeButton,
@@ -648,8 +698,11 @@ function renderSidebar(root) {
         status,
     );
     panel = {root, backend, optimizer, generation, video, meta, settings, prompt, restore,
-        restoreGenerate, feedback, start, end, analyze: analyzeButton, analysis, apply,
-        applyGenerate, status};
+        restoreGenerate, feedback, start, end, reasoningEffort, analyze: analyzeButton, analysis, apply,
+        applyGenerate, status, maxTokensMode, maxTokens, tokenPresets: null};
+    maxTokensMode.addEventListener("change", updateMaxTokens);
+    reasoningEffort.addEventListener("change", updateMaxTokens);
+    updateMaxTokens();
     optimizer.addEventListener("change", refreshGeneration);
     generation.addEventListener("change", selectGeneration);
     refreshBackendStatus();

@@ -19,7 +19,7 @@ from .registry import (
     latest_generation,
     mark_analysis_applied,
 )
-from .schemas import AnalyzeRequest
+from .schemas import ANALYSIS_MAX_TOKENS, AnalyzeRequest
 from .vlm import (
     VLMBackendBusyError,
     VLMConfigurationError,
@@ -65,6 +65,7 @@ async def optimizer_status(_request):
     return web.json_response({
         "status": "ready",
         "version": "0.8.1",
+        "analysis_max_tokens": ANALYSIS_MAX_TOKENS,
         **vlm_status,
     })
 
